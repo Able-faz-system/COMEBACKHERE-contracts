@@ -48,17 +48,42 @@ impl TreasuryContract {
     /// The signer is pruned from storage and excluded from `get_all_signers`.
     /// Existing settlement approval snapshots are not changed, so removing a
     /// signer does not retroactively invalidate in-flight approvals.
+    /// Errors: `QuorumBreak` if removal would reduce total weight below threshold.
     /// Emits: `signer_removed`.
     pub fn remove_signer(env: Env, admin: Address, signer: Address) -> Result<(), TreasuryError> {
         require_admin(&env, &admin);
-        env.storage()
+
+        let threshold: u32 = env.storage().instance().get(&DataKey::Threshold).unwrap_or(0);
+        let signer_weight: u32 = env
+            .storage()
             .instance()
-            .remove(&DataKey::Signer(signer.clone()));
+            .get(&DataKey::Signer(signer.clone()))
+            .unwrap_or(0);
+
         let list: Vec<Address> = env
             .storage()
             .instance()
             .get(&DataKey::SignerList)
             .unwrap_or_else(|| Vec::new(&env));
+
+        let mut total_weight: u32 = 0;
+        for s in list.iter() {
+            let w: u32 = env
+                .storage()
+                .instance()
+                .get(&DataKey::Signer(s.clone()))
+                .unwrap_or(0);
+            total_weight = total_weight.saturating_add(w);
+        }
+
+        let weight_after_removal = total_weight.saturating_sub(signer_weight);
+        if weight_after_removal < threshold {
+            return Err(TreasuryError::QuorumBreak);
+        }
+
+        env.storage()
+            .instance()
+            .remove(&DataKey::Signer(signer.clone()));
         let mut updated = Vec::new(&env);
         for s in list.iter() {
             if s != signer {
@@ -93,6 +118,21 @@ impl TreasuryContract {
             result.push_back((signer, weight));
         }
         result
+    }
+
+    /// Returns the ledger timestamp of the most recent approval recorded for
+    /// `signer`, or `None` if the signer has never submitted an approval (#587).
+    ///
+    /// The timestamp is updated by `record_approval` on every approval path
+    /// (settlement proposals and approvals, dispute votes, signer rotations)
+    /// so this value reflects the last time the key was actively used.
+    /// Operators can use this to detect inactive keys early and rotate them
+    /// before it becomes a quorum risk — e.g. flag any signer that has not
+    /// approved anything in the last 90 days.
+    pub fn get_signer_last_active(env: Env, signer: Address) -> Option<u64> {
+        env.storage()
+            .instance()
+            .get(&DataKey::SignerLastActive(signer))
     }
 
     /// Proposes replacing `old_signer` with `new_signer` in the authorised signer set.
