@@ -72,8 +72,19 @@ impl TreasuryContract {
     }
 
     /// Updates the multisig approval threshold required to execute settlements (admin-only).
+    ///
+    /// **Deprecated (#570):** this entrypoint changes the threshold immediately on a
+    /// single admin signature, with no reaction window — lowering the threshold is
+    /// just as dangerous as adding a malicious signer. Prefer the timelocked flow:
+    /// `propose_signer_change` with `SignerChangeKind::UpdateThreshold`, then
+    /// `execute_signer_change` once the delay has elapsed. Kept working, unchanged,
+    /// per the deprecation policy in CONTRIBUTING.md; scheduled for removal no
+    /// earlier than the next minor version.
     /// Errors: `ZeroThreshold`, `ThresholdUnreachable`.
-    /// Emits: `threshold_updated`.
+    /// Emits: `threshold_updated`, `update_threshold_deprecated`.
+    #[deprecated(
+        note = "bypasses the signer-change timelock; use propose_signer_change(SignerChangeKind::UpdateThreshold) + execute_signer_change instead"
+    )]
     pub fn update_threshold(
         env: Env,
         admin: Address,
@@ -85,7 +96,7 @@ impl TreasuryContract {
         }
         let total_weight: u32 = Self::get_all_signers(env.clone())
             .iter()
-            .map(|(_, weight)| weight)
+            .map(|(_, weight, _)| weight)
             .sum();
         if new_threshold > total_weight {
             return Err(TreasuryError::ThresholdUnreachable);
@@ -95,6 +106,8 @@ impl TreasuryContract {
             .set(&DataKey::Threshold, &new_threshold);
         env.events()
             .publish((Symbol::new(&env, "threshold_updated"),), new_threshold);
+        env.events()
+            .publish((Symbol::new(&env, "update_threshold_deprecated"),), admin);
         Ok(())
     }
 

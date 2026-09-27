@@ -3,7 +3,11 @@ use crate::{
     TreasuryContractArgs, TreasuryContractClient, TreasuryError,
 };
 use multisig::{meets_threshold, record_approval, require_authorized_signer, signer_weight};
-use soroban_sdk::{contractimpl, Address, Env, Symbol, Vec};
+use soroban_sdk::{contractimpl, Address, Env, String, Symbol, Vec};
+
+/// Maximum length (in bytes) accepted for an optional signer label (#568).
+/// Labels are purely informational and are never consulted for authorisation.
+pub(crate) const MAX_SIGNER_LABEL_LEN: u32 = 64;
 
 #[contractimpl]
 impl TreasuryContract {
@@ -40,6 +44,38 @@ impl TreasuryContract {
         }
         env.events()
             .publish((Symbol::new(&env, "signer_weight_set"), signer), weight);
+        Ok(())
+    }
+
+    /// Sets (or clears, with an empty string) an optional human-readable label for
+    /// `signer` (admin-only), e.g. "ops-hot-key" or "cfo-ledger" (#568).
+    ///
+    /// Labels exist purely to make governance UIs and audit logs easier to read —
+    /// they are never consulted for authorisation and do not require `signer` to
+    /// already be registered. Length-capped at `MAX_SIGNER_LABEL_LEN` bytes.
+    /// Errors: `LabelTooLong`.
+    /// Emits: `signer_label_set`.
+    pub fn set_signer_label(
+        env: Env,
+        admin: Address,
+        signer: Address,
+        label: String,
+    ) -> Result<(), TreasuryError> {
+        require_admin(&env, &admin);
+        if label.len() > MAX_SIGNER_LABEL_LEN {
+            return Err(TreasuryError::LabelTooLong);
+        }
+        if label.is_empty() {
+            env.storage()
+                .instance()
+                .remove(&DataKey::SignerLabel(signer.clone()));
+        } else {
+            env.storage()
+                .instance()
+                .set(&DataKey::SignerLabel(signer.clone()), &label);
+        }
+        env.events()
+            .publish((Symbol::new(&env, "signer_label_set"), signer), label);
         Ok(())
     }
 
@@ -101,8 +137,10 @@ impl TreasuryContract {
         signer_weight(&env, &signer)
     }
 
-    /// Returns all registered signers and their current weights.
-    pub fn get_all_signers(env: Env) -> Vec<(Address, u32)> {
+    /// Returns all registered signers with their current weights and optional
+    /// human-readable labels (#568). `label` is `None` when no label was set via
+    /// `set_signer_label` — labels are informational only and never affect auth.
+    pub fn get_all_signers(env: Env) -> Vec<(Address, u32, Option<String>)> {
         let list: Vec<Address> = env
             .storage()
             .instance()
@@ -115,7 +153,11 @@ impl TreasuryContract {
                 .instance()
                 .get(&DataKey::Signer(signer.clone()))
                 .unwrap_or(0);
-            result.push_back((signer, weight));
+            let label: Option<String> = env
+                .storage()
+                .instance()
+                .get(&DataKey::SignerLabel(signer.clone()));
+            result.push_back((signer, weight, label));
         }
         result
     }

@@ -79,7 +79,7 @@ fn remove_signer_excludes_signer_from_registry_output() {
     assert_eq!(client.get_signer_weight(&signer), 0);
     let signers = client.get_all_signers();
     assert_eq!(signers.len(), 1);
-    assert_eq!(signers.get(0).unwrap(), (admin, 1));
+    assert_eq!(signers.get(0).unwrap(), (admin, 1, None));
 }
 
 #[test]

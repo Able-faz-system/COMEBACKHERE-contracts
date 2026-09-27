@@ -69,6 +69,8 @@ pub enum TreasuryError {
     // Appended for #447: the referenced signer/threshold change has already been
     // executed or cancelled and cannot be acted on again.
     SignerChangeAlreadyFinalised = 40,
+    // Appended for #568: an optional signer label exceeds MAX_SIGNER_LABEL_LEN.
+    LabelTooLong = 41,
 }
 
 // Issue #48: reason codes attached to a held settlement; None means not on hold
@@ -293,6 +295,9 @@ pub enum DataKey {
     SignerChange(u64),
     /// Admin-configurable settlement proposal expiry window in seconds (#562).
     SettlementExpirySecs,
+    /// Optional human-readable label for a signer (issue #568), e.g. "ops-hot-key".
+    /// Purely informational — never consulted for authorisation decisions.
+    SignerLabel(Address),
 }
 
 /// Returns the approval weight assigned to `signer`, or `0` if not registered.
