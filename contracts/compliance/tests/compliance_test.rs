@@ -1033,7 +1033,7 @@ fn sweep_expired_clears_lapsed_temp_allow_and_emits_event() {
 
     env.ledger().set_timestamp(now + 200);
 
-    let swept = client.sweep_expired(&admin);
+    let swept = client.sweep_expired(&admin, &0);
     assert_eq!(swept, 1);
     assert_eq!(
         last_event_symbol(&env),
@@ -1049,7 +1049,7 @@ fn sweep_expired_ignores_addresses_not_yet_expired() {
     let now = env.ledger().timestamp();
     client.allow_address_until(&admin, &subject, &(now + 1000));
 
-    let swept = client.sweep_expired(&admin);
+    let swept = client.sweep_expired(&admin, &0);
     assert_eq!(swept, 0);
     assert!(client.is_allowed(&subject));
 }
@@ -1059,7 +1059,7 @@ fn sweep_expired_ignores_permanently_allowed_addresses() {
     let (env, admin, subject, client) = setup();
     client.allow_address(&admin, &subject);
 
-    let swept = client.sweep_expired(&admin);
+    let swept = client.sweep_expired(&admin, &0);
     assert_eq!(swept, 0);
     assert!(client.is_allowed(&subject));
 }
@@ -1080,7 +1080,7 @@ fn sweep_expired_only_counts_lapsed_entries_among_several() {
 
     env.ledger().set_timestamp(now + 100);
 
-    let swept = client.sweep_expired(&admin);
+    let swept = client.sweep_expired(&admin, &0);
     assert_eq!(swept, 2);
     assert!(!client.is_allowed(&expired_a));
     assert!(!client.is_allowed(&expired_b));
@@ -1095,9 +1095,9 @@ fn sweep_expired_is_idempotent_when_called_twice() {
     client.allow_address_until(&admin, &subject, &(now + 50));
     env.ledger().set_timestamp(now + 100);
 
-    let first = client.sweep_expired(&admin);
+    let first = client.sweep_expired(&admin, &0);
     assert_eq!(first, 1);
-    let second = client.sweep_expired(&admin);
+    let second = client.sweep_expired(&admin, &0);
     assert_eq!(second, 0);
 }
 
@@ -1111,6 +1111,6 @@ fn sweep_expired_returns_unauthorized_for_non_admin() {
     let client = ComplianceContractClient::new(&env, &id);
     client.initialize(&admin);
 
-    let result = client.try_sweep_expired(&non_admin);
+    let result = client.try_sweep_expired(&non_admin, &0);
     assert_eq!(result, Err(Ok(ContractError::Unauthorized)));
 }

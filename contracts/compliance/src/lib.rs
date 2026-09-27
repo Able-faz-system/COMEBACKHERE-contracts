@@ -847,17 +847,28 @@ impl ComplianceContract {
     /// for every tracked address whose `AllowedUntil` has passed, it clears the
     /// `Allowed` flag, removes the expiry, and publishes `("address_allow_expired",) → address`.
     ///
-    /// Returns the number of addresses swept.
+    /// The `limit` parameter caps how many *expired* entries are processed in a
+    /// single invocation so that callers can stay within the Soroban CPU and
+    /// memory budget on large address sets (#596). Pass `0` to sweep all expired
+    /// entries in one call (suitable only for small sets where the full scan fits
+    /// within budget). When `limit > 0`, the caller should invoke `sweep_expired`
+    /// in a loop until it returns `0` to ensure all expired entries are cleared.
+    ///
+    /// Returns the number of addresses swept (i.e. expired entries cleared).
     ///
     /// Not gated behind `require_not_paused`: sweeping only clears already-lapsed
     /// time-bound allows, so it is treated as bookkeeping rather than a new grant
     /// of access, and admins may run it even while paused.
-    pub fn sweep_expired(env: Env, admin: Address) -> Result<u32, ContractError> {
+    pub fn sweep_expired(env: Env, admin: Address, limit: u32) -> Result<u32, ContractError> {
         Self::require_admin(&env, &admin)?;
         let index = Self::address_index(&env);
         let now = env.ledger().timestamp();
         let mut swept = 0u32;
         for addr in index.iter() {
+            // Stop once the caller's requested limit has been reached.
+            if limit > 0 && swept >= limit {
+                break;
+            }
             let allowed: bool = env
                 .storage()
                 .persistent()
