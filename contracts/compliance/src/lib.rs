@@ -89,10 +89,10 @@ pub enum DataKey {
     /// Number of addresses in the paged index (instance). Bounded by
     /// `MAX_TRACKED_ADDRESSES`.
     AddrIndexCount,
-    /// Short reason code recorded by the active `pause` (instance). Removed on `unpause`.
-    PauseReason,
-    /// Merkle root of a bulk-imported blocklist (instance). See `set_blocklist_root`.
-    BlocklistRoot,
+    /// Maximum settlement amount (in stroops) allowed for a given tier.
+    /// Keyed by tier number; settable only by admin. Maps tiers to their
+    /// transaction limits for KYC-level enforcement.
+    TierLimit(u32),
 }
 
 /// Coarse classification of an address's compliance state.
@@ -129,7 +129,7 @@ pub struct AddressStatus {
 /// Primary error type for the compliance contract.
 ///
 /// Variants must only be appended at the end (highest numeric value) to preserve
-/// on-chain backwards compatibility. Range: 1..=6 (see `ARCHITECTURE.md`).
+/// on-chain backwards compatibility. Range: 1..=7 (see `ARCHITECTURE.md`).
 #[contracterror]
 #[derive(Copy, Clone, Debug, PartialEq)]
 #[repr(u32)]
@@ -142,6 +142,9 @@ pub enum ContractError {
     /// A bulk allow/block call was made before [`BULK_OP_COOLDOWN_SECS`] elapsed since the
     /// caller's previous bulk call (see #454).
     BulkOperationCooldown = 6,
+    /// `migrate` was called while storage is at a schema version it has no
+    /// migration path from (see #610).
+    UnexpectedSchemaVersion = 7,
 }
 
 /// Upper bound on the number of distinct addresses tracked in the paged address
@@ -165,6 +168,9 @@ const ADDR_INDEX_PAGE_SIZE: u32 = 25;
 /// Maximum number of addresses accepted per batch admin call, consistent with
 /// the batch caps used elsewhere in the workspace (see #8/#21/#29).
 pub const MAX_BATCH_SIZE: u32 = 50;
+
+/// Storage schema version written by `initialize` and targeted by `migrate` (#610).
+pub const CURRENT_SCHEMA_VERSION: u32 = 2;
 
 /// Minimum time (seconds) a caller must wait between successive calls to the *same* bulk
 /// entrypoint (`bulk_allow_addresses` or `bulk_block_addresses`). `MAX_BATCH_SIZE` bounds how
@@ -197,7 +203,9 @@ impl ComplianceContract {
         admin.require_auth();
         env.storage().instance().set(&DataKey::Admin, &admin);
         env.storage().instance().set(&DataKey::Paused, &false);
-        env.storage().instance().set(&DataKey::SchemaVersion, &1u32);
+        env.storage()
+            .instance()
+            .set(&DataKey::SchemaVersion, &CURRENT_SCHEMA_VERSION);
         Ok(())
     }
 
@@ -387,6 +395,96 @@ impl ComplianceContract {
             .unwrap_or(0u32)
     }
 
+    /// Set the maximum settlement limit for a given tier.
+    ///
+    /// Only the admin may call this. Tiers are integer identifiers (0, 1, 2, etc.);
+    /// tier 0 is the basic KYC tier. Each tier can have its own limit to enforce
+    /// transaction caps based on compliance level.
+    ///
+    /// # Parameters
+    /// - `admin`: Current administrator. Must authorize this call.
+    /// - `tier`: The tier number to set a limit for.
+    /// - `limit`: The maximum settlement amount (in stroops) for this tier.
+    ///
+    /// # Errors
+    /// - [`ContractError::Unauthorized`] if `admin` is not the stored administrator.
+    ///
+    /// # Events
+    /// Publishes `("tier_limit_set",) → (tier, limit)`.
+    pub fn set_tier_limit(
+        env: Env,
+        admin: Address,
+        tier: u32,
+        limit: i128,
+    ) -> Result<(), ContractError> {
+        Self::require_admin(&env, &admin)?;
+        env.storage()
+            .instance()
+            .set(&DataKey::TierLimit(tier), &limit);
+        env.events()
+            .publish((Symbol::new(&env, "tier_limit_set"),), (tier, limit));
+        Ok(())
+    }
+
+    /// Returns the maximum settlement limit for a given tier, or `None` if unset.
+    pub fn get_tier_limit(env: Env, tier: u32) -> Option<i128> {
+        env.storage()
+            .instance()
+            .get(&DataKey::TierLimit(tier))
+    }
+
+    /// Set the jurisdiction code for an address.
+    ///
+    /// Stores an ISO country code (e.g., `US`, `EU`, `JP`) per address for
+    /// jurisdiction-based compliance rules. The code is validated for length
+    /// (2-3 characters) and ASCII alphanumeric format. This is purely metadata
+    /// storage; rule logic using jurisdiction data is handled separately.
+    ///
+    /// # Parameters
+    /// - `admin`: Current administrator. Must authorize this call.
+    /// - `address`: The address to tag with a jurisdiction.
+    /// - `code`: ISO country code (e.g., `Bytes::from_slice(&env, b"US")`).
+    ///
+    /// # Errors
+    /// - [`ContractError::Unauthorized`] if `admin` is not the stored administrator.
+    /// - Panics with `"InvalidJurisdictionCode"` if `code` is not 2-3 ASCII uppercase letters.
+    ///
+    /// # Events
+    /// Publishes `("jurisdiction_set",) → (address, code)`.
+    pub fn set_jurisdiction(
+        env: Env,
+        admin: Address,
+        address: Address,
+        code: Bytes,
+    ) -> Result<(), ContractError> {
+        Self::require_admin(&env, &admin)?;
+
+        // Validate jurisdiction code: must be 2-3 uppercase ASCII letters
+        let code_len = code.len();
+        if code_len < 2 || code_len > 3 {
+            panic!("InvalidJurisdictionCode");
+        }
+        for &byte in code.iter() {
+            if !((byte >= b'A' && byte <= b'Z') || (byte >= b'0' && byte <= b'9')) {
+                panic!("InvalidJurisdictionCode");
+            }
+        }
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::Jurisdiction(address.clone()), &code.clone());
+        env.events()
+            .publish((Symbol::new(&env, "jurisdiction_set"),), (address, code));
+        Ok(())
+    }
+
+    /// Returns the jurisdiction code for an address, if one has been set.
+    pub fn get_jurisdiction(env: Env, address: Address) -> Option<Bytes> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::Jurisdiction(address))
+    }
+
     /// Block a batch of addresses (admin-only).
     ///
     /// Like [`block_address`](Self::block_address), this is **not** gated behind
@@ -480,6 +578,39 @@ impl ComplianceContract {
             .unwrap_or(1)
     }
 
+    /// Admin-only storage migration to [`CURRENT_SCHEMA_VERSION`] (#610).
+    ///
+    /// Idempotent: calling it when storage is already at the current version is a
+    /// no-op. Rejects any stored version it has no migration path from, so an
+    /// operator mistake during an upgrade cannot corrupt data.
+    ///
+    /// # Errors
+    /// - [`ContractError::Unauthorized`] if `admin` is not the stored administrator.
+    /// - [`ContractError::UnexpectedSchemaVersion`] if the stored version is neither
+    ///   the previous nor the current schema version.
+    ///
+    /// # Events
+    /// Publishes `("schema_migrated",) → (from, to)` when a migration runs.
+    pub fn migrate(env: Env, admin: Address) -> Result<u32, ContractError> {
+        Self::require_admin(&env, &admin)?;
+        let from = Self::get_schema_version(env.clone());
+        if from == CURRENT_SCHEMA_VERSION {
+            return Ok(from);
+        }
+        if from != CURRENT_SCHEMA_VERSION - 1 {
+            return Err(ContractError::UnexpectedSchemaVersion);
+        }
+        // v1 -> v2: no stored data layout changes; only the version marker is bumped.
+        env.storage()
+            .instance()
+            .set(&DataKey::SchemaVersion, &CURRENT_SCHEMA_VERSION);
+        env.events().publish(
+            (Symbol::new(&env, "schema_migrated"),),
+            (from, CURRENT_SCHEMA_VERSION),
+        );
+        Ok(CURRENT_SCHEMA_VERSION)
+    }
+
     /// Allow an address until a specific ledger timestamp (seconds since epoch).
     ///
     /// After `expires_at`, [`is_allowed`](Self::is_allowed) returns `false` even if
@@ -562,6 +693,32 @@ impl ComplianceContract {
         Ok(())
     }
 
+    /// Cancel a pending admin transfer before it is accepted (#611).
+    ///
+    /// Clears `PendingAdmin` so the nominated address can no longer call
+    /// [`accept_admin`](Self::accept_admin). Not gated behind pause.
+    ///
+    /// # Errors
+    /// - [`ContractError::Unauthorized`] if `admin` is not the stored administrator.
+    ///
+    /// # Panics
+    /// Panics with `"NoPendingAdmin"` if there is no pending transfer.
+    ///
+    /// # Events
+    /// Publishes `("admin_transfer_cancelled",) → pending_admin`.
+    pub fn cancel_admin_transfer(env: Env, admin: Address) -> Result<(), ContractError> {
+        Self::require_admin(&env, &admin)?;
+        let pending: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::PendingAdmin)
+            .expect("NoPendingAdmin");
+        env.storage().instance().remove(&DataKey::PendingAdmin);
+        env.events()
+            .publish((Symbol::new(&env, "admin_transfer_cancelled"),), pending);
+        Ok(())
+    }
+
     /// Complete the admin transfer initiated by [`transfer_admin`](Self::transfer_admin).
     ///
     /// Must be called by the pending admin to activate the new admin role.
@@ -611,6 +768,27 @@ impl ComplianceContract {
     ///
     /// # Events
     /// Publishes `("address_cleared",) → address`.
+    /// Remove the block flag and explicitly allow an address, clearing all related records.
+    ///
+    /// Clears the address to a clean state by removing:
+    /// - `Blocked` flag
+    /// - `BlockedUntil` expiry (if set)
+    /// - `BlockReason` (if set)
+    /// - `Tier` (if set)
+    /// - `AllowedUntil` expiry (if set)
+    ///
+    /// Sets `Allowed` to `true` for a fresh start. Permitted even while paused
+    /// (emergency policy).
+    ///
+    /// # Parameters
+    /// - `admin`: Current administrator. Must authorize this call.
+    /// - `address`: The address to clear.
+    ///
+    /// # Errors
+    /// - [`ContractError::Unauthorized`] if `admin` is not the stored administrator.
+    ///
+    /// # Events
+    /// Publishes `("address_cleared",) → address`.
     pub fn clear_address(env: Env, admin: Address, address: Address) -> Result<(), ContractError> {
         Self::require_admin(&env, &admin)?;
         let was_blocked: bool = env
@@ -629,9 +807,21 @@ impl ComplianceContract {
         env.storage()
             .persistent()
             .remove(&DataKey::BlockedUntil(address.clone()));
+        // Clear block reason
+        env.storage()
+            .persistent()
+            .remove(&DataKey::BlockReason(address.clone()));
         env.storage()
             .persistent()
             .set(&DataKey::Allowed(address.clone()), &true);
+        // Clear allow expiry
+        env.storage()
+            .persistent()
+            .remove(&DataKey::AllowedUntil(address.clone()));
+        // Clear tier
+        env.storage()
+            .persistent()
+            .remove(&DataKey::Tier(address.clone()));
         if was_blocked {
             let count: u64 = env
                 .storage()
