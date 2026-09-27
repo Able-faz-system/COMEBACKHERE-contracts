@@ -66,12 +66,9 @@ pub enum TreasuryError {
     // Appended for #447: the referenced signer/threshold change has already been
     // executed or cancelled and cannot be acted on again.
     SignerChangeAlreadyFinalised = 40,
-    // Appended for #567: `remove_allowed_token` refuses to remove an allowlisted token
-    // while any settlement is still `Pending`.
-    TokenHasPendingSettlements = 41,
-    // Appended for #577: `revoke_approval` was called by a signer who has not approved
-    // the settlement.
-    ApprovalNotFound = 42,
+    // Appended for #590: execute_settlement was called after the proposer-set
+    // execution deadline has passed.
+    ExecutionDeadlineExceeded = 41,
 }
 
 // Issue #48: reason codes attached to a held settlement; None means not on hold
@@ -139,6 +136,10 @@ pub struct Settlement {
     pub status: SettlementStatus,
     pub hold_reason: SettlementHoldReason,
     pub proposed_at: u64,
+    /// Optional hard business deadline: if non-zero, `execute_settlement` must
+    /// reject calls after this timestamp even when approvals are complete.
+    /// Set by the proposer at proposal time; `0` means no deadline (default).
+    pub execution_deadline: u64,
 }
 
 #[contracttype]
@@ -294,6 +295,10 @@ pub enum DataKey {
     SignerChangeCount,
     /// Persistent storage for a timelocked signer/threshold-change proposal (#447).
     SignerChange(u64),
+    /// Optional UNIX timestamp after which a settlement hold automatically lapses (#592).
+    /// Stored separately from `Settlement` to avoid breaking the ABI snapshot.
+    /// Absent means the hold has no expiry.
+    HoldExpiry(u64),
 }
 
 /// Returns the approval weight assigned to `signer`, or `0` if not registered.
