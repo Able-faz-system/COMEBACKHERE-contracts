@@ -3,7 +3,10 @@ use crate::{
     SettlementStatus, TreasuryContract, TreasuryContractArgs, TreasuryContractClient, TreasuryError,
     MAX_ALLOWED_TOKENS,
 };
-use multisig::{meets_threshold, record_approval, require_authorized_signer, signer_weight};
+use multisig::{
+    meets_threshold, record_approval, require_authorized_signer,
+    revoke_approval as revoke_signer_approval, signer_weight,
+};
 use soroban_sdk::{contractimpl, token, Address, Env, Symbol, Vec};
 
 const SETTLEMENT_TTL: u64 = 7 * 24 * 60 * 60;
@@ -12,9 +15,35 @@ const SETTLEMENT_TTL: u64 = 7 * 24 * 60 * 60;
 /// the batch caps used elsewhere in the workspace (see #8/#21).
 const MAX_BATCH_SIZE: u32 = 50;
 
+/// Whether any settlement is still `Pending`. Stops at the first one found.
+fn has_pending_settlement(env: &Env) -> bool {
+    let count: u64 = env
+        .storage()
+        .instance()
+        .get(&DataKey::SettlementCount)
+        .unwrap_or(0);
+    let mut id = 1u64;
+    while id <= count {
+        if let Some(settlement) = env
+            .storage()
+            .persistent()
+            .get::<DataKey, Settlement>(&DataKey::Settlement(id))
+        {
+            if settlement.status == SettlementStatus::Pending {
+                return true;
+            }
+        }
+        id += 1;
+    }
+    false
+}
+
 #[contractimpl]
 impl TreasuryContract {
     /// Proposes a new settlement of `amount` tokens payable to `merchant_address`.
+    /// An optional `execution_deadline` (Unix timestamp) may be set; if non-zero,
+    /// `execute_settlement` will reject calls after that timestamp even when approvals
+    /// are complete. Pass `0` for no deadline.
     /// Preconditions: contract not paused; `signer` must be an authorised signer with non-zero weight.
     /// Panics: `ContractPaused`, `UnauthorizedSigner`.
     /// Errors: `InvalidAmount`, `ArithmeticOverflow`.
@@ -24,6 +53,7 @@ impl TreasuryContract {
         signer: Address,
         merchant_address: Address,
         amount: i128,
+        execution_deadline: u64,
     ) -> Result<u64, TreasuryError> {
         Self::propose_settlement_with_token(env, signer, merchant_address, amount, MaybeAddress::None)
     }
@@ -69,7 +99,7 @@ impl TreasuryContract {
             status: SettlementStatus::Pending,
             hold_reason: SettlementHoldReason::None,
             proposed_at: env.ledger().timestamp(),
-            token,
+            execution_deadline,
         };
         env.storage()
             .persistent()
@@ -86,8 +116,9 @@ impl TreasuryContract {
         signer: Address,
         merchant_address: Address,
         amount: i128,
+        execution_deadline: u64,
     ) -> Result<u64, TreasuryError> {
-        Self::propose_settlement(env, signer, merchant_address, amount)
+        Self::propose_settlement(env, signer, merchant_address, amount, execution_deadline)
     }
 
     /// Adds `signer`'s weight to the approval set of a pending settlement.
@@ -121,6 +152,49 @@ impl TreasuryContract {
         env.events().publish(
             (Symbol::new(&env, "settlement_approved"), settlement_id),
             settlement.clone(),
+        );
+        Ok(settlement)
+    }
+
+    /// Withdraws `signer`'s earlier approval of a pending settlement, subtracting their weight
+    /// from the settlement's approval weight. If that drops the total below the threshold,
+    /// `execute_settlement` is blocked again until enough approvals are re-collected.
+    /// Only possible while the settlement is still `Pending` (i.e. before execution).
+    /// Panics: `ContractPaused`, `UnauthorizedSigner`.
+    /// Errors: `SettlementNotFound`, `AlreadyExecuted`, `ApprovalNotFound`.
+    /// Emits: `settlement_approval_revoked`.
+    pub fn revoke_approval(
+        env: Env,
+        signer: Address,
+        settlement_id: u64,
+    ) -> Result<Settlement, TreasuryError> {
+        require_not_paused(&env);
+        require_authorized_signer(&env, &signer);
+        let mut settlement: Settlement = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Settlement(settlement_id))
+            .ok_or(TreasuryError::SettlementNotFound)?;
+        if settlement.status != SettlementStatus::Pending {
+            return Err(TreasuryError::AlreadyExecuted);
+        }
+        if !revoke_signer_approval(
+            &env,
+            &mut settlement.approvals,
+            &mut settlement.approval_weight,
+            &signer,
+        ) {
+            return Err(TreasuryError::ApprovalNotFound);
+        }
+        env.storage()
+            .persistent()
+            .set(&DataKey::Settlement(settlement_id), &settlement);
+        env.events().publish(
+            (
+                Symbol::new(&env, "settlement_approval_revoked"),
+                settlement_id,
+            ),
+            (signer, settlement.clone()),
         );
         Ok(settlement)
     }
@@ -252,9 +326,24 @@ impl TreasuryContract {
             .get(&DataKey::Settlement(settlement_id))
             .ok_or(TreasuryError::SettlementNotFound)?;
         if settlement.status == SettlementStatus::OnHold {
-            return Err(TreasuryError::SettlementOnHold);
+            // Treat an expired hold as released — check whether the hold still
+            // applies before rejecting execution.
+            let hold_expired = env
+                .storage()
+                .persistent()
+                .get::<_, u64>(&DataKey::HoldExpiry(settlement_id))
+                .map(|expires_at| env.ledger().timestamp() >= expires_at)
+                .unwrap_or(false);
+            if !hold_expired {
+                return Err(TreasuryError::SettlementOnHold);
+            }
+            // Hold has lapsed — treat as Pending for execution purposes.
+            // The status remains OnHold in storage until explicitly released
+            // (lazy evaluation, consistent with compliance's AllowedUntil pattern).
         }
-        if settlement.status != SettlementStatus::Pending {
+        if settlement.status != SettlementStatus::Pending
+            && settlement.status != SettlementStatus::OnHold
+        {
             return Err(TreasuryError::AlreadyExecuted);
         }
         let threshold: u32 = env
@@ -267,6 +356,13 @@ impl TreasuryContract {
         }
         if !meets_threshold(settlement.approval_weight, threshold) {
             return Err(TreasuryError::ThresholdNotMet);
+        }
+        // Enforce execution deadline: if the proposer set a non-zero deadline,
+        // reject execution after that timestamp even when approvals are complete.
+        if settlement.execution_deadline > 0
+            && env.ledger().timestamp() > settlement.execution_deadline
+        {
+            return Err(TreasuryError::ExecutionDeadlineExceeded);
         }
         if token_contract == env.current_contract_address() {
             return Err(TreasuryError::InvalidTokenContract);
@@ -647,6 +743,11 @@ impl TreasuryContract {
     }
 
     /// Removes `token` from the settlement token allowlist (admin-only).
+    /// A settlement does not record its token (it is supplied to `execute_settlement`), so
+    /// any `Pending` settlement is treated as potentially depending on every allowlisted
+    /// token: removal of an allowlisted token is refused until none remain pending.
+    /// Removing a token that is not on the allowlist is not blocked.
+    /// Panics: `Unauthorized`, `TokenHasPendingSettlements`.
     /// Emits: `token_removed`.
     pub fn remove_allowed_token(env: Env, admin: Address, token: Address) {
         require_admin(&env, &admin);
@@ -655,6 +756,9 @@ impl TreasuryContract {
             .instance()
             .get(&DataKey::TokenAllowlist)
             .unwrap_or_else(|| Vec::new(&env));
+        if allowlist.contains(&token) && has_pending_settlement(&env) {
+            soroban_sdk::panic_with_error!(env, TreasuryError::TokenHasPendingSettlements);
+        }
         let mut updated = Vec::new(&env);
         for t in allowlist.iter() {
             if t != token {

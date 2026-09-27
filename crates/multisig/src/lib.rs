@@ -66,6 +66,9 @@ pub enum TreasuryError {
     // Appended for #447: the referenced signer/threshold change has already been
     // executed or cancelled and cannot be acted on again.
     SignerChangeAlreadyFinalised = 40,
+    // Appended for #590: execute_settlement was called after the proposer-set
+    // execution deadline has passed.
+    ExecutionDeadlineExceeded = 41,
 }
 
 // Issue #48: reason codes attached to a held settlement; None means not on hold
@@ -133,9 +136,10 @@ pub struct Settlement {
     pub status: SettlementStatus,
     pub hold_reason: SettlementHoldReason,
     pub proposed_at: u64,
-    /// The intended token for this settlement, captured at proposal time.
-    /// `MaybeAddress::None` means no specific token was specified at proposal time.
-    pub token: MaybeAddress,
+    /// Optional hard business deadline: if non-zero, `execute_settlement` must
+    /// reject calls after this timestamp even when approvals are complete.
+    /// Set by the proposer at proposal time; `0` means no deadline (default).
+    pub execution_deadline: u64,
 }
 
 #[contracttype]
@@ -303,8 +307,10 @@ pub enum DataKey {
     SignerChangeCount,
     /// Persistent storage for a timelocked signer/threshold-change proposal (#447).
     SignerChange(u64),
-    /// Last ledger timestamp at which a signer contributed an approval (#587).
-    SignerLastActive(Address),
+    /// Optional UNIX timestamp after which a settlement hold automatically lapses (#592).
+    /// Stored separately from `Settlement` to avoid breaking the ABI snapshot.
+    /// Absent means the hold has no expiry.
+    HoldExpiry(u64),
 }
 
 /// Returns the approval weight assigned to `signer`, or `0` if not registered.
@@ -413,15 +419,56 @@ pub fn record_approval(
         .set(&DataKey::SignerLastActive(signer.clone()), &now);
 }
 
+/// Withdraws `signer`'s approval: removes `signer` from `approvals` and subtracts their weight
+/// from `weight`. The inverse of [`record_approval`]. Returns `false` (leaving both untouched)
+/// if `signer` has not approved.
+///
+/// The weight subtracted is `signer`'s *current* weight, mirroring how [`record_approval`] adds
+/// the weight in force at approval time. The subtraction saturates at zero, so if a signer's
+/// weight was raised after they approved the total can never underflow; it can only end up
+/// lower (execution stays blocked) rather than higher.
+///
+/// # Examples
+///
+/// ```rust,no_run
+/// use soroban_sdk::{Address, Env, Vec};
+/// use multisig::{record_approval, revoke_approval};
+///
+/// # let env: Env = unimplemented!();
+/// # let signer: Address = unimplemented!();
+/// # let mut approvals: Vec<Address> = unimplemented!();
+/// # let mut weight: u32 = 0;
+/// record_approval(&env, &mut approvals, &mut weight, &signer);
+/// // Changed their mind before execution: take the approval back.
+/// assert!(revoke_approval(&env, &mut approvals, &mut weight, &signer));
+/// // Revoking again is a no-op.
+/// assert!(!revoke_approval(&env, &mut approvals, &mut weight, &signer));
+/// ```
+pub fn revoke_approval(
+    env: &Env,
+    approvals: &mut Vec<Address>,
+    weight: &mut u32,
+    signer: &Address,
+) -> bool {
+    match approvals.first_index_of(signer) {
+        Some(index) => {
+            approvals.remove(index);
+            *weight = weight.saturating_sub(signer_weight(env, signer));
+            true
+        }
+        None => false,
+    }
+}
+
 /// Builds expiry metadata for a newly collected approval.
 pub fn approval_expiry(env: &Env, signer: &Address, ttl_seconds: u64) -> ApprovalExpiry {
     let approved_at = env.ledger().timestamp();
     let expires_at = if ttl_seconds == 0 {
         0
     } else {
-        approved_at
-            .checked_add(ttl_seconds)
-            .unwrap_or_else(|| soroban_sdk::panic_with_error!(env, TreasuryError::ArithmeticOverflow))
+        approved_at.checked_add(ttl_seconds).unwrap_or_else(|| {
+            soroban_sdk::panic_with_error!(env, TreasuryError::ArithmeticOverflow)
+        })
     };
     ApprovalExpiry {
         signer: signer.clone(),
