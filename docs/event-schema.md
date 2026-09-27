@@ -157,6 +157,7 @@ Source: `contracts/treasury/src/{lib,settlements,disputes,deposits,holds,signers
 |---|---|---|---|
 | `treasury_initialized` | `(Symbol,)` | `Address` (admin) | `initialize` |
 | `threshold_updated` | `(Symbol,)` | `u32` (new_threshold) | `update_threshold` |
+| `update_threshold_deprecated` | `(Symbol,)` | `Address` (admin) | `update_threshold` (#570; deprecation-signal event emitted on every call so off-chain indexers can detect remaining callers of the deprecated direct path — see CONTRIBUTING.md "Deprecating an entrypoint") |
 | `treasury_paused` | `(Symbol,)` | `Address` (admin) | `pause` |
 | `treasury_unpaused` | `(Symbol,)` | `Address` (admin) | `unpause` |
 | `withdrawal_limit_set` | `(Symbol,)` | `(i128, u64)` — `(limit, window_secs)` | `set_withdrawal_limit` |
@@ -183,6 +184,7 @@ Source: `contracts/treasury/src/{lib,settlements,disputes,deposits,holds,signers
 | `withdraw` | `(Symbol, to: Address)` | `i128` (amount) | `withdraw` |
 | `treasury_drained` | `(Symbol,)` | `Address` (recipient) | `withdraw_all` |
 | `signer_weight_set` | `(Symbol, signer: Address)` | `u32` (weight) | `set_signer` |
+| `signer_label_set` | `(Symbol, signer: Address)` | `String` (label) | `set_signer_label` (#568; informational only, never consulted for authorisation) |
 | `signer_removed` | `(Symbol,)` | `Address` (signer) | `remove_signer` |
 | `rotation_proposed` | `(Symbol, id: u64)` | `SignerRotationProposal` | `propose_signer_rotation` |
 | `rotation_approved` | `(Symbol, rotation_id: u64)` | `SignerRotationProposal` | `approve_signer_rotation` |

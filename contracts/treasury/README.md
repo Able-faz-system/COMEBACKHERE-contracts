@@ -21,7 +21,7 @@ The Treasury contract manages funds and settlements using a multi-signature appr
 | `get_pending_settlements` | None | None | `Vec<Settlement>` | None |
 | `get_pending_settlements_page` | None | `start: u64, limit: u64` | `Vec<Settlement>` | None |
 | `get_settlement` | None | `settlement_id: u64` | `Settlement` | `SettlementNotFound` |
-| `update_threshold` | `admin` | `admin: Address, new_threshold: u32` | `Result<(), TreasuryError>` | `Unauthorized`, `ZeroThreshold` |
+| `update_threshold` (**deprecated**, #570 — bypasses the signer-change timelock; use `propose_signer_change`/`execute_signer_change` instead) | `admin` | `admin: Address, new_threshold: u32` | `Result<(), TreasuryError>` | `Unauthorized`, `ZeroThreshold` |
 | `pause` | `admin` | `admin: Address` | `()` | `Unauthorized` |
 | `unpause` | `admin` | `admin: Address` | `()` | `Unauthorized` |
 | `raise_dispute` | `claimant` | `claimant: Address, settlement_id: u64, counterparty: Address, amount: i128` | `u64` | `ContractPaused`, `Unauthorized`, `InvalidAmount` |
