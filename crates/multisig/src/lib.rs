@@ -58,6 +58,9 @@ pub enum TreasuryError {
     // Appended for `force_cancel_settlement`: the target settlement is already in a
     // terminal state (Executed, Cancelled, Expired) and cannot be force-cancelled.
     ForceCancelNotAllowed = 37,
+    // Appended for `remove_signer` (#563): removing the signer would reduce total
+    // weight below the current threshold, breaking quorum.
+    QuorumBreak = 38,
     // Appended for #447: a timelocked signer/threshold change cannot be executed
     // before its minimum delay has elapsed.
     SignerChangeTooEarly = 38,

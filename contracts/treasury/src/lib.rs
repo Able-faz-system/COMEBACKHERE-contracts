@@ -50,6 +50,9 @@ impl TreasuryContract {
         env.storage().instance().set(&DataKey::DisputeCount, &0u64);
         env.storage()
             .instance()
+            .set(&DataKey::SettlementExpirySecs, &(7u64 * 24 * 60 * 60));
+        env.storage()
+            .instance()
             .set(&DataKey::Signer(admin.clone()), &1u32);
         let mut signer_list = Vec::new(&env);
         signer_list.push_back(admin.clone());
